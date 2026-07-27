@@ -190,3 +190,104 @@ export class RabeTransactionTracker {
 }
 
 export const rabeTracker = new RabeTransactionTracker();
+
+// ---------------------------------------------------------------------------
+// Session persistence — active address caching across reload cycles
+// ---------------------------------------------------------------------------
+
+/** Storage key used to persist the active Rabe session in localStorage. */
+export const RABE_SESSION_STORAGE_KEY = "rabe_active_session";
+
+/**
+ * Shape of the serialized session stored in localStorage.
+ * `address` is the active Stellar public key.
+ * `savedAt` is a Unix-ms timestamp recorded when the session was written.
+ */
+export interface RabeActiveSession {
+  address: string;
+  savedAt: number;
+}
+
+/**
+ * Maximum age (in milliseconds) a persisted session is considered valid.
+ * Sessions older than this are rejected by {@link parseActiveSession}.
+ * Default: 7 days.
+ */
+export const RABE_SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Safely parses and validates a raw JSON string (typically read from
+ * localStorage) as a {@link RabeActiveSession}.
+ *
+ * Validation rules:
+ * - Must be valid JSON.
+ * - Must contain a non-empty `address` string field.
+ * - Must contain a numeric `savedAt` field.
+ * - The session must not be older than {@link RABE_SESSION_MAX_AGE_MS}.
+ *
+ * Returns `null` for any malformed or expired input.
+ */
+export function parseActiveSession(raw: string | null): RabeActiveSession | null {
+  if (!raw) return null;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return null;
+  }
+
+  const obj = parsed as Record<string, unknown>;
+
+  if (typeof obj.address !== "string" || obj.address.trim() === "") {
+    return null;
+  }
+
+  if (typeof obj.savedAt !== "number" || !Number.isFinite(obj.savedAt)) {
+    return null;
+  }
+
+  const age = Date.now() - obj.savedAt;
+  if (age < 0 || age > RABE_SESSION_MAX_AGE_MS) {
+    return null;
+  }
+
+  return { address: obj.address.trim(), savedAt: obj.savedAt };
+}
+
+/**
+ * Writes the active address to localStorage so it can be restored on the next
+ * page load.  Safe to call in SSR contexts — the write is skipped when
+ * `localStorage` is unavailable.
+ */
+export function saveActiveSession(address: string): void {
+  if (typeof localStorage === "undefined") return;
+
+  const session: RabeActiveSession = { address, savedAt: Date.now() };
+  localStorage.setItem(RABE_SESSION_STORAGE_KEY, JSON.stringify(session));
+}
+
+/**
+ * Reads and validates the persisted session from localStorage.
+ * Returns the parsed {@link RabeActiveSession} or `null` when no valid
+ * session exists.  Safe to call in SSR contexts.
+ */
+export function loadActiveSession(): RabeActiveSession | null {
+  if (typeof localStorage === "undefined") return null;
+
+  const raw = localStorage.getItem(RABE_SESSION_STORAGE_KEY);
+  return parseActiveSession(raw);
+}
+
+/**
+ * Removes the persisted session from localStorage (e.g. on explicit wallet
+ * disconnect).  Safe to call in SSR contexts.
+ */
+export function clearActiveSession(): void {
+  if (typeof localStorage === "undefined") return;
+  localStorage.removeItem(RABE_SESSION_STORAGE_KEY);
+}

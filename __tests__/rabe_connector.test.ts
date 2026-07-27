@@ -1,12 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   checkRabeNetworkMatch,
+  clearActiveSession,
   formatConsoleWarningBlock,
   formatStackTrace,
+  loadActiveSession,
   logRabeWarning,
+  parseActiveSession,
+  RABE_SESSION_MAX_AGE_MS,
+  RABE_SESSION_STORAGE_KEY,
+  RabeActiveSession,
   RabeNetworkMismatchError,
   RabeTransactionTracker,
   rabeTracker,
+  saveActiveSession,
   warnOnRabeNetworkMismatch,
 } from "@/app/lib/rabe_connector";
 
@@ -166,5 +173,225 @@ describe("rabe_connector network mismatch checks", () => {
     const state = warnOnRabeNetworkMismatch("testnet", "testnet");
     expect(state.mismatched).toBe(false);
     expect(warnSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Session persistence tests
+// ---------------------------------------------------------------------------
+
+describe("parseActiveSession — validation rules", () => {
+  it("returns null for null input", () => {
+    expect(parseActiveSession(null)).toBeNull();
+  });
+
+  it("returns null for empty string", () => {
+    expect(parseActiveSession("")).toBeNull();
+  });
+
+  it("returns null for non-JSON string", () => {
+    expect(parseActiveSession("not json")).toBeNull();
+  });
+
+  it("returns null when JSON is a primitive", () => {
+    expect(parseActiveSession("42")).toBeNull();
+    expect(parseActiveSession('"hello"')).toBeNull();
+    expect(parseActiveSession("true")).toBeNull();
+  });
+
+  it("returns null when JSON is an array", () => {
+    expect(parseActiveSession("[]")).toBeNull();
+  });
+
+  it("returns null when address field is missing", () => {
+    const raw = JSON.stringify({ savedAt: Date.now() });
+    expect(parseActiveSession(raw)).toBeNull();
+  });
+
+  it("returns null when address field is not a string", () => {
+    const raw = JSON.stringify({ address: 123, savedAt: Date.now() });
+    expect(parseActiveSession(raw)).toBeNull();
+  });
+
+  it("returns null when address is an empty string", () => {
+    const raw = JSON.stringify({ address: "   ", savedAt: Date.now() });
+    expect(parseActiveSession(raw)).toBeNull();
+  });
+
+  it("returns null when savedAt field is missing", () => {
+    const raw = JSON.stringify({ address: "GABCDEF" });
+    expect(parseActiveSession(raw)).toBeNull();
+  });
+
+  it("returns null when savedAt is not a finite number", () => {
+    const rawNaN = JSON.stringify({ address: "GABCDEF", savedAt: NaN });
+    const rawInf = JSON.stringify({ address: "GABCDEF", savedAt: Infinity });
+    const rawStr = JSON.stringify({ address: "GABCDEF", savedAt: "123" });
+    // JSON.stringify strips NaN/Infinity to null, test string variant
+    expect(parseActiveSession(rawStr)).toBeNull();
+    // NaN serialises to null in JSON
+    expect(parseActiveSession(rawNaN)).toBeNull();
+    // Infinity serialises to null in JSON
+    expect(parseActiveSession(rawInf)).toBeNull();
+  });
+
+  it("returns null when the session is older than RABE_SESSION_MAX_AGE_MS", () => {
+    const expiredAt = Date.now() - RABE_SESSION_MAX_AGE_MS - 1000;
+    const raw = JSON.stringify({ address: "GABCDEF", savedAt: expiredAt });
+    expect(parseActiveSession(raw)).toBeNull();
+  });
+
+  it("returns null when savedAt is in the future beyond tolerance", () => {
+    // Negative age (future timestamp) should also be rejected
+    const futureAt = Date.now() + 1000;
+    const raw = JSON.stringify({ address: "GABCDEF", savedAt: futureAt });
+    expect(parseActiveSession(raw)).toBeNull();
+  });
+
+  it("returns a valid RabeActiveSession for a fresh, well-formed entry", () => {
+    const now = Date.now();
+    const raw = JSON.stringify({ address: "GABCDEF1234", savedAt: now });
+    const result = parseActiveSession(raw);
+    expect(result).not.toBeNull();
+    expect(result!.address).toBe("GABCDEF1234");
+    expect(result!.savedAt).toBe(now);
+  });
+
+  it("trims whitespace from the address field", () => {
+    const raw = JSON.stringify({ address: "  GABCDEF  ", savedAt: Date.now() });
+    const result = parseActiveSession(raw);
+    expect(result).not.toBeNull();
+    expect(result!.address).toBe("GABCDEF");
+  });
+
+  it("ignores extra unknown fields in the stored object", () => {
+    const raw = JSON.stringify({
+      address: "GABCDEF",
+      savedAt: Date.now(),
+      extraField: "should be ignored",
+    });
+    const result = parseActiveSession(raw);
+    expect(result).not.toBeNull();
+    expect(result!.address).toBe("GABCDEF");
+    expect((result as unknown as Record<string, unknown>).extraField).toBeUndefined();
+  });
+});
+
+describe("saveActiveSession / loadActiveSession / clearActiveSession — localStorage integration", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    localStorage.clear();
+  });
+
+  it("saveActiveSession writes a JSON entry under RABE_SESSION_STORAGE_KEY", () => {
+    saveActiveSession("GTEST1234");
+    const raw = localStorage.getItem(RABE_SESSION_STORAGE_KEY);
+    expect(raw).not.toBeNull();
+    const parsed = JSON.parse(raw!);
+    expect(parsed.address).toBe("GTEST1234");
+    expect(typeof parsed.savedAt).toBe("number");
+  });
+
+  it("loadActiveSession returns null when nothing is stored", () => {
+    expect(loadActiveSession()).toBeNull();
+  });
+
+  it("loadActiveSession returns the session that was previously saved", () => {
+    saveActiveSession("GACTIVE5678");
+    const session = loadActiveSession();
+    expect(session).not.toBeNull();
+    expect(session!.address).toBe("GACTIVE5678");
+  });
+
+  it("loadActiveSession returns null after clearActiveSession is called", () => {
+    saveActiveSession("GACTIVE5678");
+    clearActiveSession();
+    expect(loadActiveSession()).toBeNull();
+  });
+
+  it("clearActiveSession removes the key from localStorage", () => {
+    saveActiveSession("GTEST9999");
+    clearActiveSession();
+    expect(localStorage.getItem(RABE_SESSION_STORAGE_KEY)).toBeNull();
+  });
+
+  it("saveActiveSession records savedAt close to the current time", () => {
+    const before = Date.now();
+    saveActiveSession("GTIMECHECK");
+    const after = Date.now();
+
+    const raw = localStorage.getItem(RABE_SESSION_STORAGE_KEY)!;
+    const { savedAt } = JSON.parse(raw) as RabeActiveSession;
+    expect(savedAt).toBeGreaterThanOrEqual(before);
+    expect(savedAt).toBeLessThanOrEqual(after);
+  });
+
+  it("overwriting a saved session replaces the previous address", () => {
+    saveActiveSession("GFIRST");
+    saveActiveSession("GSECOND");
+    const session = loadActiveSession();
+    expect(session!.address).toBe("GSECOND");
+  });
+});
+
+describe("rabe_connector — reload cycle simulation", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    localStorage.clear();
+  });
+
+  it("persists and restores an active address across a simulated reload", () => {
+    // Simulate: user connects wallet, address is saved
+    const originalAddress = "GRELOAD_STELLAR_ADDRESS_XYZ";
+    saveActiveSession(originalAddress);
+
+    // Simulate: page reloads — read back from storage
+    const restored = loadActiveSession();
+
+    expect(restored).not.toBeNull();
+    expect(restored!.address).toBe(originalAddress);
+  });
+
+  it("does not restore an expired session after a simulated reload", () => {
+    // Manually write an expired session directly to localStorage
+    const expired: RabeActiveSession = {
+      address: "GEXPIRED",
+      savedAt: Date.now() - RABE_SESSION_MAX_AGE_MS - 5000,
+    };
+    localStorage.setItem(RABE_SESSION_STORAGE_KEY, JSON.stringify(expired));
+
+    // Simulate reload — loadActiveSession should reject it
+    const restored = loadActiveSession();
+    expect(restored).toBeNull();
+  });
+
+  it("does not restore a malformed session after a simulated reload", () => {
+    localStorage.setItem(RABE_SESSION_STORAGE_KEY, "{{bad json}}");
+    expect(loadActiveSession()).toBeNull();
+  });
+
+  it("returns null after explicit disconnect clears the session", () => {
+    saveActiveSession("GDISCONNECT_TEST");
+    clearActiveSession(); // simulate disconnect
+
+    // Reload — nothing should be found
+    expect(loadActiveSession()).toBeNull();
+  });
+
+  it("exposes RABE_SESSION_STORAGE_KEY as a string constant", () => {
+    expect(typeof RABE_SESSION_STORAGE_KEY).toBe("string");
+    expect(RABE_SESSION_STORAGE_KEY.length).toBeGreaterThan(0);
+  });
+
+  it("exposes RABE_SESSION_MAX_AGE_MS as a positive finite number", () => {
+    expect(typeof RABE_SESSION_MAX_AGE_MS).toBe("number");
+    expect(RABE_SESSION_MAX_AGE_MS).toBeGreaterThan(0);
+    expect(Number.isFinite(RABE_SESSION_MAX_AGE_MS)).toBe(true);
   });
 });
