@@ -1,12 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   checkRabeNetworkMatch,
+  clearRabeSession,
   formatConsoleWarningBlock,
   formatStackTrace,
+  loadRabeSession,
   logRabeWarning,
+  RABE_SESSION_CACHE_KEY,
   RabeNetworkMismatchError,
   RabeTransactionTracker,
   rabeTracker,
+  saveRabeSession,
   warnOnRabeNetworkMismatch,
 } from "@/app/lib/rabe_connector";
 
@@ -166,5 +170,244 @@ describe("rabe_connector network mismatch checks", () => {
     const state = warnOnRabeNetworkMismatch("testnet", "testnet");
     expect(state.mismatched).toBe(false);
     expect(warnSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Persistent session cache tests
+// ---------------------------------------------------------------------------
+
+/** A valid Stellar G-key used throughout the caching tests. */
+const VALID_ADDRESS = "GDQOE23CFSUMSVQK4Y5JHPPYK73VYCNHZHA7ENKCV37P6SUEO6XQBKPP";
+
+describe("rabe_connector persistent session cache", () => {
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    // Provide an in-memory localStorage shim for every test.
+    const store: Record<string, string> = {};
+    vi.stubGlobal("localStorage", {
+      getItem: (key: string) => store[key] ?? null,
+      setItem: (key: string, value: string) => {
+        store[key] = value;
+      },
+      removeItem: (key: string) => {
+        delete store[key];
+      },
+    });
+
+    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    warnSpy.mockRestore();
+  });
+
+  // --- saveRabeSession ---
+
+  it("saves a session with the correct shape to localStorage", () => {
+    saveRabeSession(VALID_ADDRESS, "testnet");
+
+    const raw = localStorage.getItem(RABE_SESSION_CACHE_KEY);
+    expect(raw).not.toBeNull();
+
+    const parsed = JSON.parse(raw!);
+    expect(parsed.activeAddress).toBe(VALID_ADDRESS);
+    expect(parsed.network).toBe("testnet");
+    expect(typeof parsed.cachedAt).toBe("number");
+    expect(parsed.cachedAt).toBeGreaterThan(0);
+  });
+
+  it("saves a mainnet session correctly", () => {
+    saveRabeSession(VALID_ADDRESS, "mainnet");
+
+    const raw = localStorage.getItem(RABE_SESSION_CACHE_KEY);
+    const parsed = JSON.parse(raw!);
+    expect(parsed.network).toBe("mainnet");
+  });
+
+  it("overwrites an existing cache entry when called again", () => {
+    const OTHER_ADDRESS = "GBMU3L4W6V75GZVI5BF35FSNMRHB5JZSD3U7FPXCUKYVQINBT4PPLPNL" as const;
+    saveRabeSession(VALID_ADDRESS, "testnet");
+    saveRabeSession(OTHER_ADDRESS, "mainnet");
+
+    const raw = localStorage.getItem(RABE_SESSION_CACHE_KEY);
+    const parsed = JSON.parse(raw!);
+    expect(parsed.activeAddress).toBe(OTHER_ADDRESS);
+    expect(parsed.network).toBe("mainnet");
+  });
+
+  it("logs a warning and does not throw when localStorage.setItem throws", () => {
+    vi.stubGlobal("localStorage", {
+      getItem: () => null,
+      setItem: () => {
+        throw new Error("QuotaExceededError");
+      },
+      removeItem: () => {},
+    });
+
+    expect(() => saveRabeSession(VALID_ADDRESS, "testnet")).not.toThrow();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(String(warnSpy.mock.calls[0][0])).toContain("SESSION CACHE WRITE FAILED");
+  });
+
+  // --- loadRabeSession ---
+
+  it("loads a previously saved session correctly (simulates reload)", () => {
+    saveRabeSession(VALID_ADDRESS, "testnet");
+
+    // Simulate a reload by calling loadRabeSession in isolation.
+    const session = loadRabeSession();
+
+    expect(session).not.toBeNull();
+    expect(session!.activeAddress).toBe(VALID_ADDRESS);
+    expect(session!.network).toBe("testnet");
+    expect(typeof session!.cachedAt).toBe("number");
+  });
+
+  it("returns null when no session has been saved", () => {
+    const session = loadRabeSession();
+    expect(session).toBeNull();
+  });
+
+  it("returns null and clears the entry when the stored JSON is malformed", () => {
+    localStorage.setItem(RABE_SESSION_CACHE_KEY, "not-valid-json{{{{");
+
+    const session = loadRabeSession();
+    expect(session).toBeNull();
+    // The corrupt entry should be removed.
+    expect(localStorage.getItem(RABE_SESSION_CACHE_KEY)).toBeNull();
+  });
+
+  it("rejects and clears a payload that is missing the activeAddress field", () => {
+    localStorage.setItem(
+      RABE_SESSION_CACHE_KEY,
+      JSON.stringify({ network: "testnet", cachedAt: Date.now() })
+    );
+
+    const session = loadRabeSession();
+    expect(session).toBeNull();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(String(warnSpy.mock.calls[0][0])).toContain("SESSION CACHE INVALID");
+    // The invalid entry must be evicted.
+    expect(localStorage.getItem(RABE_SESSION_CACHE_KEY)).toBeNull();
+  });
+
+  it("rejects a payload with an invalid (non-G-key) activeAddress", () => {
+    localStorage.setItem(
+      RABE_SESSION_CACHE_KEY,
+      JSON.stringify({
+        activeAddress: "not-a-stellar-key",
+        network: "testnet",
+        cachedAt: Date.now(),
+      })
+    );
+
+    const session = loadRabeSession();
+    expect(session).toBeNull();
+    expect(localStorage.getItem(RABE_SESSION_CACHE_KEY)).toBeNull();
+  });
+
+  it("rejects a payload with an unknown network value", () => {
+    localStorage.setItem(
+      RABE_SESSION_CACHE_KEY,
+      JSON.stringify({
+        activeAddress: VALID_ADDRESS,
+        network: "devnet", // invalid
+        cachedAt: Date.now(),
+      })
+    );
+
+    const session = loadRabeSession();
+    expect(session).toBeNull();
+  });
+
+  it("rejects a payload where cachedAt is not a number", () => {
+    localStorage.setItem(
+      RABE_SESSION_CACHE_KEY,
+      JSON.stringify({
+        activeAddress: VALID_ADDRESS,
+        network: "testnet",
+        cachedAt: "yesterday",
+      })
+    );
+
+    expect(loadRabeSession()).toBeNull();
+  });
+
+  it("rejects an empty-string activeAddress", () => {
+    localStorage.setItem(
+      RABE_SESSION_CACHE_KEY,
+      JSON.stringify({
+        activeAddress: "",
+        network: "testnet",
+        cachedAt: Date.now(),
+      })
+    );
+
+    expect(loadRabeSession()).toBeNull();
+  });
+
+  it("logs a warning and returns null when localStorage.getItem throws", () => {
+    vi.stubGlobal("localStorage", {
+      getItem: () => {
+        throw new Error("SecurityError");
+      },
+      setItem: () => {},
+      removeItem: () => {},
+    });
+
+    const session = loadRabeSession();
+    expect(session).toBeNull();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(String(warnSpy.mock.calls[0][0])).toContain("SESSION CACHE READ FAILED");
+  });
+
+  // --- clearRabeSession ---
+
+  it("removes the persisted session on clearRabeSession", () => {
+    saveRabeSession(VALID_ADDRESS, "testnet");
+    expect(localStorage.getItem(RABE_SESSION_CACHE_KEY)).not.toBeNull();
+
+    clearRabeSession();
+    expect(localStorage.getItem(RABE_SESSION_CACHE_KEY)).toBeNull();
+  });
+
+  it("does not throw when clearRabeSession is called with no cached session", () => {
+    expect(() => clearRabeSession()).not.toThrow();
+  });
+
+  it("logs a warning and does not throw when localStorage.removeItem throws", () => {
+    vi.stubGlobal("localStorage", {
+      getItem: () => null,
+      setItem: () => {},
+      removeItem: () => {
+        throw new Error("SecurityError");
+      },
+    });
+
+    expect(() => clearRabeSession()).not.toThrow();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(String(warnSpy.mock.calls[0][0])).toContain("SESSION CACHE CLEAR FAILED");
+  });
+
+  // --- round-trip: save → load → clear ---
+
+  it("full round-trip: save, reload, then clear", () => {
+    saveRabeSession(VALID_ADDRESS, "testnet");
+
+    const loaded = loadRabeSession();
+    expect(loaded).not.toBeNull();
+    expect(loaded!.activeAddress).toBe(VALID_ADDRESS);
+    expect(loaded!.network).toBe("testnet");
+
+    clearRabeSession();
+    expect(loadRabeSession()).toBeNull();
+  });
+
+  it("RABE_SESSION_CACHE_KEY is a non-empty string constant", () => {
+    expect(typeof RABE_SESSION_CACHE_KEY).toBe("string");
+    expect(RABE_SESSION_CACHE_KEY.length).toBeGreaterThan(0);
   });
 });
