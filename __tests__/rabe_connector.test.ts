@@ -8,6 +8,8 @@ import {
   logRabeWarning,
   RABE_SESSION_CACHE_KEY,
   RabeNetworkMismatchError,
+  rabeSessionCache,
+  RabeSessionCache,
   RabeTransactionTracker,
   rabeTracker,
   saveRabeSession,
@@ -409,5 +411,178 @@ describe("rabe_connector persistent session cache", () => {
   it("RABE_SESSION_CACHE_KEY is a non-empty string constant", () => {
     expect(typeof RABE_SESSION_CACHE_KEY).toBe("string");
     expect(RABE_SESSION_CACHE_KEY.length).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RabeSessionCache class tests
+// ---------------------------------------------------------------------------
+
+describe("RabeSessionCache", () => {
+  const VALID_ADDRESS = "GDQOE23CFSUMSVQK4Y5JHPPYK73VYCNHZHA7ENKCV37P6SUEO6XQBKPP";
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+    localStorage.clear();
+  });
+
+  it("save() persists the address and network to localStorage", () => {
+    const cache = new RabeSessionCache();
+    cache.save(VALID_ADDRESS, "testnet");
+
+    const raw = localStorage.getItem(RABE_SESSION_CACHE_KEY);
+    expect(raw).not.toBeNull();
+    const parsed = JSON.parse(raw!);
+    expect(parsed.activeAddress).toBe(VALID_ADDRESS);
+    expect(parsed.network).toBe("testnet");
+  });
+
+  it("load() returns null when nothing is stored", () => {
+    const cache = new RabeSessionCache();
+    expect(cache.load()).toBeNull();
+  });
+
+  it("load() returns the stored session after save()", () => {
+    const cache = new RabeSessionCache();
+    cache.save(VALID_ADDRESS, "mainnet");
+
+    const session = cache.load();
+    expect(session).not.toBeNull();
+    expect(session!.activeAddress).toBe(VALID_ADDRESS);
+    expect(session!.network).toBe("mainnet");
+  });
+
+  it("getAddress() returns the active address when a valid session exists", () => {
+    const cache = new RabeSessionCache();
+    cache.save(VALID_ADDRESS, "testnet");
+    expect(cache.getAddress()).toBe(VALID_ADDRESS);
+  });
+
+  it("getAddress() returns null when no session is stored", () => {
+    const cache = new RabeSessionCache();
+    expect(cache.getAddress()).toBeNull();
+  });
+
+  it("getNetwork() returns the network when a valid session exists", () => {
+    const cache = new RabeSessionCache();
+    cache.save(VALID_ADDRESS, "testnet");
+    expect(cache.getNetwork()).toBe("testnet");
+  });
+
+  it("getNetwork() returns null when no session is stored", () => {
+    const cache = new RabeSessionCache();
+    expect(cache.getNetwork()).toBeNull();
+  });
+
+  it("clear() removes the entry from localStorage", () => {
+    const cache = new RabeSessionCache();
+    cache.save(VALID_ADDRESS, "testnet");
+    expect(localStorage.getItem(RABE_SESSION_CACHE_KEY)).not.toBeNull();
+
+    cache.clear();
+    expect(localStorage.getItem(RABE_SESSION_CACHE_KEY)).toBeNull();
+  });
+
+  it("clear() is safe to call when nothing is stored", () => {
+    const cache = new RabeSessionCache();
+    expect(() => cache.clear()).not.toThrow();
+  });
+
+  it("hasActiveSession() returns false when nothing is stored", () => {
+    const cache = new RabeSessionCache();
+    expect(cache.hasActiveSession()).toBe(false);
+  });
+
+  it("hasActiveSession() returns true after save()", () => {
+    const cache = new RabeSessionCache();
+    cache.save(VALID_ADDRESS, "testnet");
+    expect(cache.hasActiveSession()).toBe(true);
+  });
+
+  it("hasActiveSession() returns false after clear()", () => {
+    const cache = new RabeSessionCache();
+    cache.save(VALID_ADDRESS, "testnet");
+    cache.clear();
+    expect(cache.hasActiveSession()).toBe(false);
+  });
+
+  it("session survives a simulated page reload (new instance reads same storage)", () => {
+    const firstInstance = new RabeSessionCache();
+    firstInstance.save(VALID_ADDRESS, "testnet");
+
+    // Simulate reload: new instance, same localStorage.
+    const secondInstance = new RabeSessionCache();
+    const session = secondInstance.load();
+
+    expect(session).not.toBeNull();
+    expect(session!.activeAddress).toBe(VALID_ADDRESS);
+    expect(session!.network).toBe("testnet");
+  });
+
+  it("overwriting the session updates both address and network", () => {
+    const SECOND_ADDRESS = "GBDPECJ65UVZSBB4GZWZFBKX6NYFOLEQVS7PCFMM33GZWXBAJ27HX73X";
+    const cache = new RabeSessionCache();
+
+    cache.save(VALID_ADDRESS, "testnet");
+    cache.save(SECOND_ADDRESS, "mainnet");
+
+    expect(cache.getAddress()).toBe(SECOND_ADDRESS);
+    expect(cache.getNetwork()).toBe("mainnet");
+  });
+
+  it("full round-trip via RabeSessionCache: save → load → clear", () => {
+    const cache = new RabeSessionCache();
+
+    cache.save(VALID_ADDRESS, "testnet");
+    const loaded = cache.load();
+    expect(loaded!.activeAddress).toBe(VALID_ADDRESS);
+
+    cache.clear();
+    expect(cache.hasActiveSession()).toBe(false);
+  });
+});
+
+describe("rabeSessionCache singleton", () => {
+  const VALID_ADDRESS = "GDQOE23CFSUMSVQK4Y5JHPPYK73VYCNHZHA7ENKCV37P6SUEO6XQBKPP";
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    localStorage.clear();
+    rabeSessionCache.clear();
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+    localStorage.clear();
+    rabeSessionCache.clear();
+  });
+
+  it("exports a RabeSessionCache instance as the default singleton", () => {
+    expect(rabeSessionCache).toBeInstanceOf(RabeSessionCache);
+  });
+
+  it("singleton save() writes to the shared RABE_SESSION_CACHE_KEY", () => {
+    rabeSessionCache.save(VALID_ADDRESS, "testnet");
+    const raw = localStorage.getItem(RABE_SESSION_CACHE_KEY);
+    expect(raw).not.toBeNull();
+    expect(JSON.parse(raw!).activeAddress).toBe(VALID_ADDRESS);
+  });
+
+  it("singleton getAddress() returns the saved address", () => {
+    rabeSessionCache.save(VALID_ADDRESS, "mainnet");
+    expect(rabeSessionCache.getAddress()).toBe(VALID_ADDRESS);
+  });
+
+  it("singleton clear() removes the persisted session", () => {
+    rabeSessionCache.save(VALID_ADDRESS, "testnet");
+    rabeSessionCache.clear();
+    expect(rabeSessionCache.hasActiveSession()).toBe(false);
   });
 });

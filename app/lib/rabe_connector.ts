@@ -327,3 +327,78 @@ export function clearRabeSession(): void {
     });
   }
 }
+
+// ---------------------------------------------------------------------------
+// RabeSessionCache — object-oriented wrapper around the persistent session
+// functions above, providing a unified interface for save/load/clear/query.
+// ---------------------------------------------------------------------------
+
+/**
+ * Object-oriented cache interface that wraps {@link saveRabeSession},
+ * {@link loadRabeSession}, and {@link clearRabeSession} behind a single
+ * injectable instance.
+ *
+ * Usage
+ * ─────
+ *   rabeSessionCache.save("GABC...", "testnet");
+ *   const session = rabeSessionCache.load();   // RabeSessionState | null
+ *   rabeSessionCache.clear();
+ *
+ * The singleton `rabeSessionCache` is exported for app-wide use.
+ * Tests can construct a fresh `RabeSessionCache()` instance to avoid
+ * shared-state side-effects.
+ */
+export class RabeSessionCache {
+  /**
+   * Persists the active address and network to localStorage.
+   *
+   * @param activeAddress - Stellar public key (G… address).
+   * @param network       - Chain the session belongs to.
+   */
+  save(activeAddress: string, network: RabeNetwork): void {
+    saveRabeSession(activeAddress, network);
+  }
+
+  /**
+   * Loads the persisted session from localStorage.
+   *
+   * @returns The {@link RabeSessionState} or `null` when absent / invalid.
+   */
+  load(): RabeSessionState | null {
+    return loadRabeSession();
+  }
+
+  /**
+   * Returns the cached active address string, or `null` if no valid session
+   * exists.  Convenience wrapper around {@link load}.
+   */
+  getAddress(): string | null {
+    return this.load()?.activeAddress ?? null;
+  }
+
+  /**
+   * Returns the cached network, or `null` if no valid session exists.
+   */
+  getNetwork(): RabeNetwork | null {
+    return this.load()?.network ?? null;
+  }
+
+  /**
+   * Removes the persisted session from localStorage.  Call this on wallet
+   * disconnect to ensure no stale address survives a reload.
+   */
+  clear(): void {
+    clearRabeSession();
+  }
+
+  /**
+   * Returns `true` when a valid (non-stale, non-corrupt) session is currently
+   * stored.
+   */
+  hasActiveSession(): boolean {
+    return this.load() !== null;
+  }
+}
+
+/** Shared singleton — import and use this instance throughout the app. */
+export const rabeSessionCache = new RabeSessionCache();
