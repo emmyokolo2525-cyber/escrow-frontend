@@ -190,3 +190,152 @@ export class RabeTransactionTracker {
 }
 
 export const rabeTracker = new RabeTransactionTracker();
+
+// ─── Session State Persistence ───────────────────────────────────────────────
+
+/** The shape of data cached in localStorage to remember the active Rabe address. */
+export interface RabeSessionState {
+  /** The active Stellar public key (G…) known to the Rabe connector. */
+  activeAddress: string;
+  /** Network the address was recorded on. */
+  network: RabeNetwork;
+  /** Unix-ms timestamp when the session was last saved. */
+  connectedAt: number;
+}
+
+/** localStorage key used to persist Rabe session state. */
+export const RABE_SESSION_KEY = "rabe_connector_session";
+
+/**
+ * Reads and validates the persisted Rabe session from localStorage.
+ * Returns `null` when the key is absent, the JSON is malformed, or the
+ * stored value does not satisfy the expected shape.  All errors are swallowed
+ * so callers never have to handle storage failures.
+ */
+export function loadRabeSession(): RabeSessionState | null {
+  try {
+    const raw = localStorage.getItem(RABE_SESSION_KEY);
+    if (!raw) return null;
+
+    const parsed: unknown = JSON.parse(raw);
+
+    // Validate shape — reject anything that does not look like RabeSessionState
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      typeof (parsed as Record<string, unknown>).activeAddress !== "string" ||
+      !(parsed as Record<string, unknown>).activeAddress ||
+      typeof (parsed as Record<string, unknown>).network !== "string" ||
+      typeof (parsed as Record<string, unknown>).connectedAt !== "number"
+    ) {
+      localStorage.removeItem(RABE_SESSION_KEY);
+      return null;
+    }
+
+    const candidate = parsed as RabeSessionState;
+
+    // Validate the network value
+    if (candidate.network !== "mainnet" && candidate.network !== "testnet") {
+      localStorage.removeItem(RABE_SESSION_KEY);
+      return null;
+    }
+
+    return candidate;
+  } catch {
+    // JSON.parse or localStorage threw — clean up and treat as no session
+    try {
+      localStorage.removeItem(RABE_SESSION_KEY);
+    } catch {
+      // Storage unavailable — nothing to remove
+    }
+    return null;
+  }
+}
+
+/**
+ * Serialises and writes a Rabe session to localStorage.
+ * Any storage errors (e.g. private-browsing quota limits) are silently
+ * swallowed so callers never have to handle storage failures.
+ */
+export function saveRabeSession(session: RabeSessionState): void {
+  try {
+    localStorage.setItem(RABE_SESSION_KEY, JSON.stringify(session));
+  } catch {
+    // Storage unavailable — continue without persistence
+  }
+}
+
+/**
+ * Removes the Rabe session entry from localStorage.
+ * Safe to call even when no session exists.
+ */
+export function clearRabeSession(): void {
+  try {
+    localStorage.removeItem(RABE_SESSION_KEY);
+  } catch {
+    // Storage unavailable — nothing to clear
+  }
+}
+
+/**
+ * Manages the active-address session for the Rabe connector.
+ *
+ * Wraps `loadRabeSession`, `saveRabeSession`, and `clearRabeSession` behind a
+ * simple stateful object so consumers can set / get / clear the active address
+ * without touching localStorage directly.
+ *
+ * @example
+ * ```ts
+ * rabeSession.setActiveAddress("GABC…", "testnet");
+ * const addr = rabeSession.getActiveAddress(); // "GABC…"
+ * rabeSession.clearSession();
+ * rabeSession.getActiveAddress();              // null
+ * ```
+ */
+export class RabeSessionManager {
+  /**
+   * Persists `address` as the active Rabe address on `network`.
+   * Emits a debug warning block so the change is visible in the dev console.
+   */
+  setActiveAddress(address: string, network: RabeNetwork): void {
+    const session: RabeSessionState = {
+      activeAddress: address,
+      network,
+      connectedAt: Date.now(),
+    };
+    saveRabeSession(session);
+    logRabeWarning("SESSION SAVED", `Active address cached for ${network}`, {
+      txId: undefined,
+      phase: "idle",
+    });
+  }
+
+  /**
+   * Returns the active address from the persisted session, or `null` when no
+   * valid session exists.
+   */
+  getActiveAddress(): string | null {
+    return loadRabeSession()?.activeAddress ?? null;
+  }
+
+  /**
+   * Returns the full persisted session object, or `null` when none exists.
+   */
+  getSession(): RabeSessionState | null {
+    return loadRabeSession();
+  }
+
+  /**
+   * Clears the persisted session and emits a debug warning block.
+   */
+  clearSession(): void {
+    clearRabeSession();
+    logRabeWarning("SESSION CLEARED", "Active address removed from cache", {
+      txId: undefined,
+      phase: "idle",
+    });
+  }
+}
+
+/** Singleton `RabeSessionManager` — use this throughout the app. */
+export const rabeSession = new RabeSessionManager();
